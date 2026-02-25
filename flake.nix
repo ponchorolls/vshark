@@ -1,5 +1,4 @@
 {
-  name = 'vshark'
   description = "A high-performance network chat-like TUI";
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
