@@ -1,0 +1,12 @@
+[package]
+name = "vshark"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.26"
+crossterm = "0.27"
+tokio = { version = "1", features = ["full"] }
+# Add these for the "Chat" logic later
+pcap-parser = "0.16"
+nucleo = "0.2"
