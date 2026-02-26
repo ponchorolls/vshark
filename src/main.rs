@@ -36,6 +36,7 @@ async fn main() -> Result<(), io::Error> {
     let mut selected_stream: Option<String> = None;
     let mut searching = false;
     let mut search_query = String::new();
+    let mut formatted_hex_view = String::from("Select a stream...");
 
     terminal.clear()?;
 
@@ -52,10 +53,16 @@ async fn main() -> Result<(), io::Error> {
             *count += 1;
 
             chat_history.push(update);
-            if chat_history.len() > 100 {
+            if chat_history.len() > 50 {
                 chat_history.remove(0);
             }
         }
+        if let Some(ref target) = selected_stream {
+        if let Some(last_pkt) = chat_history.iter().filter(|p| p.summary.contains(target)).last() {
+             // Cache the formatted string here, once per update
+             formatted_hex_view = format_hex(&last_pkt.raw_data);
+        }
+    }
 
         // --- 5. Draw UI (No Input Logic or 'break' allowed here) ---
 terminal.draw(|f| {
@@ -154,10 +161,9 @@ terminal.draw(|f| {
         "Select a stream to inspect raw bytes...".to_string()
     };
 
-    let inspector = Paragraph::new(inspector_content)
-        .block(Block::default().title(" Hex Inspector (Last Packet) ").borders(Borders::ALL))
-        .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(inspector, right_chunks[1]);
+    let inspector = Paragraph::new(formatted_hex_view.as_str())
+            .block(Block::default().title(" Hex Inspector ").borders(Borders::ALL));
+        f.render_widget(inspector, right_chunks[1]);
 
     // --- 7. Search Bar Rendering ---
     if searching {
@@ -168,7 +174,7 @@ terminal.draw(|f| {
 })?;
 
         // --- 6. Handle Input (Safely outside the closure) ---
-        if event::poll(Duration::from_millis(16))? {
+        if event::poll(Duration::from_millis(33))? {
             if let Event::Key(key) = event::read()? {
                 let mut streams: Vec<String> = conversations.keys()
                     .filter(|s| s.to_lowercase().contains(&search_query.to_lowercase()))
