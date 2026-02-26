@@ -1,77 +1,77 @@
-use std::fs::File;
+use std::process::{Command, Stdio, Child};
 use std::io::Read;
-use std::process::{Command, Stdio};
 use std::sync::mpsc::Sender;
-use pcap_parser::{LegacyPcapReader, PcapBlockOwned, traits::PcapReaderIterator};
-use etherparse::{SlicedPacket, NetSlice, Ipv4Slice, Ipv6Slice};
+use etherparse::Ipv4Header;
+use std::net::Ipv4Addr;
 
 pub struct PacketUpdate {
     pub summary: String,
 }
 
-pub async fn run_sniffer(tx: Sender<PacketUpdate>) {
-    // 1. Start dumpcap writing to our FIFO
-    // We use the wrapper, but tell it to write to a FILE instead of STDOUT
-    let mut _child = Command::new("/run/wrappers/bin/dumpcap")
-        .args([
-            "-i", "any",
-            "-F", "pcap",
-            "-n",
-            "-q",
-            "-w", "/tmp/vshark_fifo" // Writing directly to the FIFO
-        ])
-        .stdout(Stdio::null()) 
+pub fn run_sniffer(tx: Sender<PacketUpdate>) -> Child {
+    // We use the standard library Command here for easier pipe management
+    let mut child = Command::new("/run/wrappers/bin/dumpcap")
+        .args(["-i", "any", "-F", "pcap", "-n", "-q", "-w", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null()) // Silence the promiscuous warning
         .spawn()
-        .expect("Failed to start dumpcap");
+        .expect("Failed to spawn dumpcap");
 
-    // 2. Open the FIFO for reading
-    // This will block until dumpcap starts writing
-    let mut file = File::open("/tmp/vshark_fifo").expect("Failed to open FIFO");
-    
-    let mut buffer = Vec::new();
-    let mut temp_buf = [0u8; 1024];
+    let mut stdout = child.stdout.take().expect("Failed to take stdout");
 
+    // Move the heavy byte-scanning to a background thread
     tokio::task::spawn_blocking(move || {
+        let mut buffer = Vec::new();
+        let mut temp_buf = [0u8; 2048];
         loop {
-            match file.read(&mut temp_buf) {
-                Ok(0) => break,
+            match stdout.read(&mut temp_buf) {
+                Ok(0) => break, // Pipe closed
                 Ok(n) => {
                     buffer.extend_from_slice(&temp_buf[..n]);
-                    let mut consumed_bytes = 0;
+                    
+                    // Prevent memory bloat on the x220
+                    if buffer.len() > 5000 {
+                        buffer.drain(..2000);
+                    }
 
-                    if let Ok(mut reader) = LegacyPcapReader::new(65536, &buffer[..]) {
-                        while let Ok((offset, block)) = reader.next() {
-                            consumed_bytes += offset;
-                            if let PcapBlockOwned::Legacy(pkt) = block {
-                                // SLL / IP detection logic
-                                let net_slice = if let Ok(s) = SlicedPacket::from_ethernet(pkt.data) {
-                                    s.net
-                                } else if pkt.data.len() > 16 {
-                                    match pkt.data[16] >> 4 {
-                                        4 => Ipv4Slice::from_slice(&pkt.data[16..]).ok().map(NetSlice::Ipv4),
-                                        6 => Ipv6Slice::from_slice(&pkt.data[16..]).ok().map(NetSlice::Ipv6),
-                                        _ => None,
-                                    }
-                                } else { None };
-
-                                if let Some(net) = net_slice {
-                                    let summary = match net {
-                                        NetSlice::Ipv4(h) => format!("{} ➔ {}", h.header().source_addr(), h.header().destination_addr()),
-                                        NetSlice::Ipv6(h) => format!("{:?} ➔ {:?}", h.header().source_addr(), h.header().destination_addr()),
-                                        _ => "Unknown".into(),
-                                    };
-                                    let _ = tx.send(PacketUpdate { summary });
-                                }
+                    let mut i = 0;
+                    while i < buffer.len().saturating_sub(20) {
+                        // Look for IPv4 Magic Byte (0x45)
+                        // Inside the while i < buffer.len() loop
+                    if buffer[i] == 0x45 {
+                        if let Ok((h, _)) = Ipv4Header::from_slice(&buffer[i..]) {
+                            let src = Ipv4Addr::from(h.source);
+                            let dst = Ipv4Addr::from(h.destination);
+        
+                            // Peek at the next 4 bytes for ports (TCP/UDP)
+                            let mut protocol_tag = "";
+                            let p_idx = i + 20; // Start of Transport Layer
+                            if buffer.len() >= p_idx + 4 {
+                                let dest_port = u16::from_be_bytes([buffer[p_idx + 2], buffer[p_idx + 3]]);
+                                protocol_tag = match dest_port {
+                                    443 => " [HTTPS]",
+                                    80  => " [HTTP]",
+                                    53  => " [DNS]",
+                                    22  => " [SSH]",
+                                    _   => "",
+                                };
                             }
-                            reader.consume(offset);
+
+                            let _ = tx.send(PacketUpdate {
+                                summary: format!("{} ➔ {}{}", src, dst, protocol_tag),
+                            });
+        
+                            i += 20; 
+                            continue;
                         }
                     }
-                    if consumed_bytes > 0 {
-                        buffer.drain(..consumed_bytes);
+                        i += 1;
                     }
                 }
                 Err(_) => break,
             }
         }
     });
+
+    child
 }
