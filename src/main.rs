@@ -31,16 +31,17 @@ async fn main() -> Result<(), io::Error> {
 
     // 3. App State
     let mut conversations: HashMap<String, u64> = HashMap::new();
-    let mut chat_history: Vec<String> = Vec::new();
+    let mut chat_history: Vec<PacketUpdate> = Vec::new();
     let mut list_state = ListState::default();
     let mut selected_stream: Option<String> = None;
+    let mut searching = false;
+    let mut search_query = String::new();
 
     terminal.clear()?;
 
     loop {
         // --- 4. Handle Incoming Data ---
         while let Ok(update) = rx.try_recv() {
-            // We use the base IP pair as the key for the sidebar
             let ip_pair = if let Some(pos) = update.summary.find(" [") {
                 update.summary[..pos].to_string()
             } else {
@@ -50,114 +51,180 @@ async fn main() -> Result<(), io::Error> {
             let count = conversations.entry(ip_pair).or_insert(0);
             *count += 1;
 
-            chat_history.push(update.summary);
+            chat_history.push(update);
             if chat_history.len() > 100 {
                 chat_history.remove(0);
             }
         }
 
-        // --- 5. Draw UI ---
-        terminal.draw(|f| {
-            let chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-                .split(f.size());
+        // --- 5. Draw UI (No Input Logic or 'break' allowed here) ---
+terminal.draw(|f| {
+    let size = f.size();
+    
+    // 1. Vertical Split: Main UI (top) and Search Bar (bottom)
+    let v_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(if searching { 3 } else { 0 }),
+        ])
+        .split(size);
 
-            // Get and Sort Streams for Sidebar
-            let mut streams: Vec<String> = conversations.keys().cloned().collect();
-            streams.sort(); // Keeps selection stable
+    // 2. Horizontal Split: Sidebar (left) and Right Column (right)
+    let main_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .split(v_chunks[0]);
 
-            // Sync the selection index to the ID (the IP string)
+    // 3. Right Column Vertical Split: Feed (top) and Hex Inspector (bottom)
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(60),
+            Constraint::Percentage(40),
+        ])
+        .split(main_chunks[1]);
+
+    // --- 4. Sidebar Logic & Rendering ---
+    let mut streams: Vec<String> = conversations.keys()
+        .filter(|s| s.to_lowercase().contains(&search_query.to_lowercase()))
+        .cloned()
+        .collect();
+    streams.sort();
+
+    if let Some(ref target) = selected_stream {
+        if let Some(pos) = streams.iter().position(|s| s == target) {
+            list_state.select(Some(pos));
+        }
+    }
+
+    let sidebar_items: Vec<ListItem> = streams.iter().map(|s| {
+        let count = conversations.get(s).unwrap_or(&0);
+        ListItem::new(format!("[{}] {}", count, s)).style(Style::default().fg(Color::Cyan))
+    }).collect();
+
+    let sidebar = List::new(sidebar_items)
+        .block(Block::default().title(" Streams ").borders(Borders::ALL))
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))
+        .highlight_symbol(">> ");
+    f.render_stateful_widget(sidebar, main_chunks[0], &mut list_state);
+
+    // --- 5. Live Feed Logic & Rendering ---
+    let filtered_lines: Vec<Line> = chat_history.iter()
+        .filter(|pkt| {
             if let Some(ref target) = selected_stream {
-                if let Some(new_index) = streams.iter().position(|s| s == target) {
-                    list_state.select(Some(new_index));
-                }
-            } else if !streams.is_empty() && list_state.selected().is_none() {
-                list_state.select(Some(0));
-                selected_stream = Some(streams[0].clone());
+                pkt.summary.contains(target)
+            } else if !search_query.is_empty() {
+                pkt.summary.to_lowercase().contains(&search_query.to_lowercase())
+            } else {
+                true
             }
+        })
+        .map(|pkt| {
+            let s = &pkt.summary;
+            let color = if s.contains("[HTTPS]") { Color::Magenta }
+                else if s.contains("[DNS]") { Color::Blue }
+                else if s.contains("[SSH]") { Color::Green }
+                else { Color::Gray };
 
-            // Sidebar Rendering
-            let sidebar_items: Vec<ListItem> = streams
-                .iter()
-                .map(|s| {
-                    let count = conversations.get(s).unwrap_or(&0);
-                    ListItem::new(format!("[{}] {}", count, s)).style(Style::default().fg(Color::Cyan))
-                })
-                .collect();
+            let max_w = (right_chunks[0].width as usize).saturating_sub(4);
+            let display_str = if s.len() > max_w {
+                format!("{}...", &s[..max_w.saturating_sub(3)])
+            } else {
+                s.clone()
+            };
+            Line::from(Span::styled(display_str, Style::default().fg(color)))
+        })
+        .collect();
 
-            let sidebar = List::new(sidebar_items)
-                .block(Block::default().title(" Streams ").borders(Borders::ALL))
-                .highlight_style(Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow))
-                .highlight_symbol(">> ");
-            f.render_stateful_widget(sidebar, chunks[0], &mut list_state);
+    let feed_title = format!(" Feed: {} ", selected_stream.as_deref().unwrap_or("All"));
+    let feed = Paragraph::new(filtered_lines)
+        .block(Block::default().title(feed_title).borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+    f.render_widget(feed, right_chunks[0]);
 
-            // Live Feed Rendering with Protocol Colors
-            let filtered_lines: Vec<Line> = chat_history
-                .iter()
-                .filter(|msg| {
-                    if let Some(ref target) = selected_stream {
-                        msg.contains(target)
-                    } else {
-                        true
-                    }
-                })
-                .map(|s| {
-                    let color = if s.contains("[HTTPS]") { Color::Magenta }
-                        else if s.contains("[DNS]") { Color::Blue }
-                        else if s.contains("[SSH]") { Color::Green }
-                        else if s.contains("[HTTP]") { Color::Yellow }
-                        else { Color::Gray };
+    // --- 6. Hex Inspector Logic & Rendering ---
+    let inspector_content = if let Some(ref target) = selected_stream {
+        chat_history.iter()
+            .filter(|pkt| pkt.summary.contains(target))
+            .last()
+            .map(|pkt| format_hex(&pkt.raw_data))
+            .unwrap_or_else(|| "Waiting for packet data...".to_string())
+    } else {
+        "Select a stream to inspect raw bytes...".to_string()
+    };
 
-                    // Manual truncation for the x220 screen
-                    let max_w = (chunks[1].width as usize).saturating_sub(4);
-                    let display_str = if s.len() > max_w {
-                        format!("{}...", &s[..max_w.saturating_sub(3)])
-                    } else {
-                        s.clone()
-                    };
+    let inspector = Paragraph::new(inspector_content)
+        .block(Block::default().title(" Hex Inspector (Last Packet) ").borders(Borders::ALL))
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(inspector, right_chunks[1]);
 
-                    Line::from(Span::styled(display_str, Style::default().fg(color)))
-                })
-                .collect();
+    // --- 7. Search Bar Rendering ---
+    if searching {
+        let s_bar = Paragraph::new(format!(" SEARCH: {}█", search_query))
+            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)));
+        f.render_widget(s_bar, v_chunks[1]);
+    }
+})?;
 
-            let chat_title = format!(" Feed: {} ", selected_stream.as_deref().unwrap_or("All"));
-            let chat = Paragraph::new(filtered_lines)
-                .block(Block::default().title(chat_title).borders(Borders::ALL))
-                .wrap(Wrap { trim: true });
-            f.render_widget(chat, chunks[1]);
-        })?;
-
-        // --- 6. Handle Input ---
+        // --- 6. Handle Input (Safely outside the closure) ---
         if event::poll(Duration::from_millis(16))? {
             if let Event::Key(key) = event::read()? {
-                let mut streams: Vec<String> = conversations.keys().cloned().collect();
+                let mut streams: Vec<String> = conversations.keys()
+                    .filter(|s| s.to_lowercase().contains(&search_query.to_lowercase()))
+                    .cloned()
+                    .collect();
                 streams.sort();
 
-                match key.code {
-                    KeyCode::Char('q') => {
-                        let _ = child_process.kill();
-                        break;
-                    }
-                    KeyCode::Down => {
-                        if !streams.is_empty() {
-                            let i = match list_state.selected() {
-                                Some(i) => if i >= streams.len() - 1 { 0 } else { i + 1 },
-                                None => 0,
-                            };
-                            selected_stream = Some(streams[i].clone());
+                if searching {
+                    match key.code {
+                        KeyCode::Enter => { searching = false; }
+                        KeyCode::Esc => { 
+                            searching = false; 
+                            search_query.clear();
+                            selected_stream = None;
                         }
+                        KeyCode::Backspace => { search_query.pop(); }
+                        KeyCode::Char(c) => { search_query.push(c); }
+                        _ => {}
                     }
-                    KeyCode::Up => {
-                        if !streams.is_empty() {
-                            let i = match list_state.selected() {
-                                Some(i) => if i == 0 { streams.len() - 1 } else { i - 1 },
-                                None => 0,
-                            };
-                            selected_stream = Some(streams[i].clone());
+                } else {
+                    match key.code {
+                        KeyCode::Char('q') => {
+                            let _ = child_process.kill();
+                            break; // This works here!
                         }
+                        KeyCode::Char('/') => {
+                            searching = true;
+                            search_query.clear();
+                        }
+                        KeyCode::Char('c') => {
+                            conversations.clear();
+                            chat_history.clear();
+                            selected_stream = None;
+                        }
+                        KeyCode::Down => {
+                            if !streams.is_empty() {
+                                let i = match list_state.selected() {
+                                    Some(i) => if i >= streams.len() - 1 { 0 } else { i + 1 },
+                                    None => 0,
+                                };
+                                selected_stream = Some(streams[i].clone());
+                                list_state.select(Some(i));
+                            }
+                        }
+                        KeyCode::Up => {
+                            if !streams.is_empty() {
+                                let i = match list_state.selected() {
+                                    Some(i) => if i == 0 { streams.len() - 1 } else { i - 1 },
+                                    None => 0,
+                                };
+                                selected_stream = Some(streams[i].clone());
+                                list_state.select(Some(i));
+                            }
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
         }
@@ -167,4 +234,31 @@ async fn main() -> Result<(), io::Error> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     Ok(())
+}
+
+fn format_hex(data: &[u8]) -> String {
+    let mut output = String::new();
+    for chunk in data.chunks(16) {
+        // Hex part
+        for byte in chunk {
+            output.push_str(&format!("{:02x} ", byte));
+        }
+        // Padding for short lines
+        if chunk.len() < 16 {
+            for _ in 0..(16 - chunk.len()) { output.push_str("   "); }
+        }
+        output.push_str(" | ");
+        // ASCII part
+        for byte in chunk {
+            if byte.is_ascii_graphic() || *byte == b' ' {
+                output.push(Default::default()); // Placeholder for push
+                output.pop();
+                output.push(*byte as char);
+            } else {
+                output.push('.');
+            }
+        }
+        output.push('\n');
+    }
+    output
 }
