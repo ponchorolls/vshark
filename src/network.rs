@@ -53,6 +53,8 @@ pub fn run_sniffer(tx: Sender<PacketUpdate>) -> Child {
                                     80  => " [HTTP]",
                                     53  => " [DNS]",
                                     22  => " [SSH]",
+                                    67  => " [DHCP Server]",
+                                    68  => " [DHCP Client]",
                                     _   => "",
                                 };
                             }
