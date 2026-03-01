@@ -11,6 +11,7 @@ pub struct PacketUpdate {
 
 pub fn run_sniffer(tx: Sender<PacketUpdate>) -> Child {
     let mut child = Command::new("/run/wrappers/bin/dumpcap")
+        // REMOVED "-f ip" to ensure data flows; we'll filter in Rust instead
         .args(["-i", "any", "-F", "pcap", "-n", "-q", "-w", "-"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -27,31 +28,36 @@ pub fn run_sniffer(tx: Sender<PacketUpdate>) -> Child {
                 Ok(0) => break,
                 Ok(n) => {
                     buffer.extend_from_slice(&temp_buf[..n]);
-                    if buffer.len() > 10000 { buffer.drain(..5000); }
+                    if buffer.len() > 8000 { buffer.drain(..4000); }
 
                     let mut i = 0;
                     while i < buffer.len().saturating_sub(20) {
+                        // Look for IPv4 Magic Byte
                         if buffer[i] == 0x45 {
                             if let Ok((h, _)) = Ipv4Header::from_slice(&buffer[i..]) {
+                                let src = Ipv4Addr::from(h.source);
+                                let dst = Ipv4Addr::from(h.destination);
+
+                                // --- NOISE FILTER: The "0.0.0.0" Fix ---
+                                // Skip if either IP is all zeros or if it's a broadcast
+                                if src.is_unspecified() || dst.is_unspecified() || src.is_broadcast() {
+                                    i += 1;
+                                    continue;
+                                }
+
                                 let total_len = h.total_len as usize;
-                                
-                                // Ensure we have the full packet in the buffer
                                 if buffer.len() >= i + total_len {
                                     let raw_packet = buffer[i..i + total_len].to_vec();
-                                    let src = Ipv4Addr::from(h.source);
-                                    let dst = Ipv4Addr::from(h.destination);
                                     
-                                    // Detect Port for protocol tag
+                                    // Port Detection logic...
                                     let mut tag = String::new();
                                     if raw_packet.len() >= 24 {
                                         let d_port = u16::from_be_bytes([raw_packet[22], raw_packet[23]]);
                                         tag = match d_port {
                                             443 => " [HTTPS]".to_string(),
-                                            53 =>  " [DNS]".to_string(),
-                                            22 =>  " [SSH]".to_string(),
-                                            67 =>  " [DHCP Server]".to_string(),
-                                            68 =>  " [DHCP Client]".to_string(),
-                                            _ => "".to_string(),
+                                            53  => " [DNS]".to_string(),
+                                            22  => " [SSH]".to_string(),
+                                            _   => "".to_string(),
                                         };
                                     }
 
@@ -59,7 +65,6 @@ pub fn run_sniffer(tx: Sender<PacketUpdate>) -> Child {
                                         summary: format!("{} ➔ {}{}", src, dst, tag),
                                         raw_data: raw_packet,
                                     });
-                                    
                                     i += total_len;
                                     continue;
                                 }
@@ -72,6 +77,5 @@ pub fn run_sniffer(tx: Sender<PacketUpdate>) -> Child {
             }
         }
     });
-
     child
 }
